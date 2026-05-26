@@ -32,6 +32,7 @@
 - [Usage](#usage)
   - [Command-line Arguments](#command-line-arguments)
   - [Usage Examples](#usage-examples)
+  - ✨**NEW** [Batch Mode for Automation](#batch-mode-for-automation)
   - [How Tool Calls Work](#how-tool-calls-work)
   - ✨**NEW** [Agent Mode](#agent-mode)
 - [Interactive Commands](#interactive-commands)
@@ -246,7 +247,205 @@ Use auto-discovery with mixed server types:
 ollmcp --mcp-server /path/to/weather.py --mcp-server-url http://localhost:8000/mcp --auto-discovery
 # Or using short flags:
 ollmcp -s /path/to/weather.py -u http://localhost:8000/mcp -a
+
+## Batch Mode for Automation
+
+The batch mode allows you to run ollmcp in a non-interactive way for automated workflows like alert summarization, bulk processing, or CI/CD integration. Batch mode processes multiple queries sequentially with auto-approved tool execution, reading input from stdin and writing results to a JSON file.
+
+### Use Cases
+
+- **Alert Summarization**: Process multiple alerts from monitoring systems
+- **Bulk Data Processing**: Apply the same analysis to multiple inputs
+- **CI/CD Integration**: Automate testing or validation workflows
+- **Batch Analysis**: Process large datasets without human interaction
+
+### Command Syntax
+
+```bash
+ollmcp batch --config CONFIG_FILE --output-file OUTPUT_FILE [OPTIONS]
 ```
+
+### Required Parameters
+
+- `--config`, `-c`: Path to batch configuration JSON file
+- `--output-file`, `-o`: Path to output JSON file for results
+
+### Optional Parameters
+
+- `--input-format`, `-f`: Input format - `lines` (default, one query per line) or `jsonl` (JSON objects per line)
+- `--loop-limit`, `-l`: Agent loop limit for tool iterations (default: 3)
+
+### Configuration File Format
+
+The batch configuration file uses the same format as the interactive client's saved configuration. See the example in `misc/batch-config-example.json`:
+
+```json
+{
+  "host": "http://localhost:11434",
+  "model": "qwen2.5:7b",
+  "server_paths": [],
+  "server_urls": [],
+  "servers_json": null,
+  "auto_discovery": true,
+  "enabledTools": {},
+  "modelConfig": {
+    "systemPrompt": "You are a helpful assistant that processes alerts and provides concise summaries.",
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "num_ctx": 4096
+  },
+  "agentSettings": {
+    "loopLimit": 3
+  },
+  "hilSettings": {
+    "enabled": false
+  }
+}
+```
+
+### Input Formats
+
+#### Lines Format (Default)
+
+One query per line, read from stdin:
+
+```bash
+echo "Summarize these alerts" | ollmcp batch --config config.json --output-file results.json
+```
+
+Or with multiple queries:
+
+```bash
+cat queries.txt | ollmcp batch --config config.json --output-file results.json
+```
+
+Where `queries.txt` contains:
+```
+Summarize the first alert
+Analyze the second alert
+Process the third alert
+```
+
+#### JSONL Format
+
+JSON objects per line, useful for structured data with metadata:
+
+```bash
+cat alerts.jsonl | ollmcp batch --config config.json --output-file results.json --input-format jsonl
+```
+
+Where `alerts.jsonl` contains:
+```jsonl
+{"query": "Summarize alert 1", "severity": "critical", "source": "database"}
+{"query": "Analyze alert 2", "severity": "warning", "source": "api"}
+{"query": "Process alert 3", "severity": "info", "source": "cache"}
+```
+
+### Output Format
+
+Results are written to the specified output file as a JSON array:
+
+```json
+[
+  {
+    "query": "Summarize these alerts",
+    "response": "The alerts indicate...",
+    "success": true,
+    "error": null,
+    "tool_calls": 5,
+    "duration_ms": 1234
+  },
+  {
+    "query": "Analyze the second alert",
+    "response": "The second alert shows...",
+    "success": true,
+    "error": null,
+    "tool_calls": 3,
+    "duration_ms": 987
+  }
+]
+```
+
+### Error Handling
+
+- **Exit Codes**: Returns `0` on success, `1` if any query fails
+- **Error Logging**: Errors are logged to stderr
+- **Partial Results**: Failed queries are included in the output with error details
+- **Progress Updates**: Progress is printed to stderr (query count, success/failure stats)
+
+### Key Differences from Interactive Mode
+
+- **No Human-in-the-Loop**: Tool confirmations are automatically approved
+- **No Context Retention**: Each query is processed independently (no conversation history)
+- **No TUI Output**: All console output is suppressed (only stderr logging)
+- **Sequential Processing**: Queries are processed one at a time
+- **Structured Output**: Results are written to a JSON file for programmatic use
+
+### Example Workflow
+
+1. **Create a configuration file**:
+   ```bash
+   cp misc/batch-config-example.json my-batch-config.json
+   # Edit my-batch-config.json with your settings
+   ```
+
+2. **Prepare your queries**:
+   ```bash
+   echo -e "Query 1\nQuery 2\nQuery 3" > queries.txt
+   ```
+
+3. **Run batch processing**:
+   ```bash
+   cat queries.txt | ollmcp batch --config my-batch-config.json --output-file results.json
+   ```
+
+4. **Check the results**:
+   ```bash
+   cat results.json | jq '.'
+   ```
+
+### Moogsoft Alert Summarization Example
+
+For the Moogsoft alert summarization use case:
+
+```bash
+# Create a config with your MCP servers and model settings
+cat > moogsoft-config.json << EOF
+{
+  "host": "http://localhost:11434",
+  "model": "qwen2.5:7b",
+  "auto_discovery": false,
+  "servers_json": "/path/to/moogsoft-servers.json",
+  "modelConfig": {
+    "systemPrompt": "You are an alert summarization assistant. Provide concise, actionable summaries of alerts.",
+    "temperature": 0.5
+  },
+  "agentSettings": {
+    "loopLimit": 5
+  },
+  "hilSettings": {
+    "enabled": false
+  }
+}
+EOF
+
+# Process alerts from a file
+cat alerts.txt | ollmcp batch --config moogsoft-config.json --output-file summaries.json
+
+# Check the exit code
+if [ $? -eq 0 ]; then
+  echo "All alerts processed successfully"
+else
+  echo "Some alerts failed to process"
+fi
+```
+
+### Performance Considerations
+
+- **Sequential Processing**: Queries are processed one at a time to ensure stability
+- **Memory Usage**: Context is cleared between queries to prevent memory buildup
+- **Tool Execution**: Tools are executed automatically without confirmation
+- **Loop Limit**: Adjust the loop limit based on your model's capabilities and task complexity
 
 ## Interactive Commands
 

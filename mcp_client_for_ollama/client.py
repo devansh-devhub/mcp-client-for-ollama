@@ -1,8 +1,10 @@
 """MCP Client for Ollama - A TUI client for interacting with Ollama models and MCP servers"""
 import asyncio
+import json
 import os
 import sys
 import select
+import time
 # Only import Unix-specific modules on non-Windows systems
 if os.name != 'nt':
     import tty # pylint: disable=E0401
@@ -416,8 +418,16 @@ class MCPClient:
             if len(self.chat_history) > max_history:
                 self.console.print(f"[dim](Showing last {max_history} of {len(self.chat_history)} conversations)[/dim]")
 
-    async def process_query(self, query: str) -> str:
-        """Process a query using Ollama and available tools"""
+    async def process_query(self, query: str, silent_mode: bool = False) -> str:
+        """Process a query using Ollama and available tools
+
+        Args:
+            query: The query to process
+            silent_mode: If True, suppress all console output (for batch mode)
+
+        Returns:
+            The response text from the model
+        """
         # Create base message with current query
         current_message = {
             "role": "user",
@@ -456,7 +466,7 @@ class MCPClient:
         # Get enabled tools from the tool manager
         enabled_tool_objects = self.tool_manager.get_enabled_tool_objects()
 
-        if not enabled_tool_objects:
+        if not enabled_tool_objects and not silent_mode:
             self.console.print("[yellow]Warning: No tools are enabled. Model will respond without tool access.[/yellow]")
 
         available_tools = [{
@@ -499,9 +509,10 @@ class MCPClient:
         tool_calls = []
         response_text, tool_calls, metrics = await self.streaming_manager.process_streaming_response(
             stream,
+            print_response=not silent_mode,
             thinking_mode=self.thinking_mode,
             show_thinking=self.show_thinking,
-            show_metrics=self.show_metrics,
+            show_metrics=self.show_metrics and not silent_mode,
             answer_render_mode=self.answer_render_mode,
             cancellation_check=lambda: self.abort_current_query
         )
@@ -532,12 +543,13 @@ class MCPClient:
                 break
 
             if loop_count >= self.loop_limit:
-                self.console.print(Panel(
-                    f"[yellow]Your current loop limit is set to [bold]{self.loop_limit}[/bold] and has been reached. Skipping additional tool calls.[/yellow]\n"
-                    f"You will probably want to increase this limit if your model requires more tool interactions to complete tasks.\n"
-                    f"You can change the loop limit with the [bold cyan]/loop-limit[/bold cyan] command.",
-                    title="[bold]Loop Limit Reached[/bold]", border_style="yellow", expand=False
-                ))
+                if not silent_mode:
+                    self.console.print(Panel(
+                        f"[yellow]Your current loop limit is set to [bold]{self.loop_limit}[/bold] and has been reached. Skipping additional tool calls.[/yellow]\n"
+                        f"You will probably want to increase this limit if your model requires more tool interactions to complete tasks.\n"
+                        f"You can change the loop limit with the [bold cyan]/loop-limit[/bold cyan] command.",
+                        title="[bold]Loop Limit Reached[/bold]", border_style="yellow", expand=False
+                    ))
                 break
 
             loop_count += 1
@@ -550,11 +562,13 @@ class MCPClient:
                 server_name, actual_tool_name = tool_name.split('.', 1) if '.' in tool_name else (None, tool_name)
 
                 if not server_name or server_name not in self.sessions:
-                    self.console.print(f"[red]Error: Unknown server for tool {tool_name}[/red]")
+                    if not silent_mode:
+                        self.console.print(f"[red]Error: Unknown server for tool {tool_name}[/red]")
                     continue
 
                 # Execute tool call
-                self.tool_display_manager.display_tool_execution(tool_name, tool_args, show=self.show_tool_execution)
+                if not silent_mode:
+                    self.tool_display_manager.display_tool_execution(tool_name, tool_args, show=self.show_tool_execution)
 
                 # Request HIL confirmation if enabled
                 self.monitor_paused = True
@@ -579,7 +593,8 @@ class MCPClient:
 
                 if not should_execute:
                     tool_response = "Tool call was skipped by user"
-                    self.tool_display_manager.display_tool_response(tool_name, tool_args, tool_response, show=self.show_tool_execution)
+                    if not silent_mode:
+                        self.tool_display_manager.display_tool_response(tool_name, tool_args, tool_response, show=self.show_tool_execution)
                     messages.append({
                         "role": "tool",
                         "content": tool_response,
@@ -589,12 +604,11 @@ class MCPClient:
 
                 # Call the tool on the specified server
                 result = None
-                with self.console.status(f"[cyan]⏳ Running {tool_name}...[/cyan]"):
+                if silent_mode:
                     try:
                         result = await self.sessions[server_name]["session"].call_tool(actual_tool_name, tool_args)
                     except Exception as e:
                         error_msg = f"Error calling tool {tool_name}: {str(e)}"
-                        self.console.print(f"[red]{error_msg}[/red]")
                         # Send error message to LLM
                         messages.append({
                             "role": "tool",
@@ -603,6 +617,21 @@ class MCPClient:
                         })
                         # Continue with next tool call if any
                         continue
+                else:
+                    with self.console.status(f"[cyan]⏳ Running {tool_name}...[/cyan]"):
+                        try:
+                            result = await self.sessions[server_name]["session"].call_tool(actual_tool_name, tool_args)
+                        except Exception as e:
+                            error_msg = f"Error calling tool {tool_name}: {str(e)}"
+                            self.console.print(f"[red]{error_msg}[/red]")
+                            # Send error message to LLM
+                            messages.append({
+                                "role": "tool",
+                                "content": error_msg,
+                                "tool_name": tool_name
+                            })
+                            # Continue with next tool call if any
+                            continue
 
                 # Extract content from tool response - decoupled from display
                 # MCP responses can contain multiple content items (text, images, etc.)
@@ -645,11 +674,12 @@ class MCPClient:
                 tool_response = "\n\n".join(text_parts) if text_parts else "Tool executed successfully (no text content returned)"
 
                 # Display tool response (independent of content extraction)
-                self.tool_display_manager.display_tool_response(
-                    tool_name, tool_args, tool_response,
-                    show=self.show_tool_execution, image_count=len(tool_images),
-                    vision_supported=has_vision
-                )
+                if not silent_mode:
+                    self.tool_display_manager.display_tool_response(
+                        tool_name, tool_args, tool_response,
+                        show=self.show_tool_execution, image_count=len(tool_images),
+                        vision_supported=has_vision
+                    )
 
                 # Build tool message for LLM
                 tool_message = {
@@ -670,17 +700,18 @@ class MCPClient:
                         "images": tool_images
                     })
                 elif tool_images and not has_vision:
-                    current_model = self.model_manager.get_current_model()
-                    image_label = "image" if len(tool_images) == 1 else "images"
-                    self.console.print(Panel(
-                        f"[yellow]The tool '{tool_name}' returned {len(tool_images)} {image_label}, "
-                        f"but the current model [cyan]{current_model}[/cyan] does not support vision.[/yellow]\n\n"
-                        "The images have been skipped. To process images, switch to a vision-capable model.",
-                        border_style="yellow",
-                        title="[bold yellow]Vision Not Supported[/bold yellow]",
-                        expand=False,
-                        padding=(1, 2)
-                    ))
+                    if not silent_mode:
+                        current_model = self.model_manager.get_current_model()
+                        image_label = "image" if len(tool_images) == 1 else "images"
+                        self.console.print(Panel(
+                            f"[yellow]The tool '{tool_name}' returned {len(tool_images)} {image_label}, "
+                            f"but the current model [cyan]{current_model}[/cyan] does not support vision.[/yellow]\n\n"
+                            "The images have been skipped. To process images, switch to a vision-capable model.",
+                            border_style="yellow",
+                            title="[bold yellow]Vision Not Supported[/bold yellow]",
+                            expand=False,
+                            padding=(1, 2)
+                        ))
 
 
             # Get stream response from Ollama with the tool results
@@ -701,9 +732,10 @@ class MCPClient:
             # Process the streaming response with thinking mode support
             followup_response, pending_tool_calls, followup_metrics = await self.streaming_manager.process_streaming_response(
                 stream,
+                print_response=not silent_mode,
                 thinking_mode=self.thinking_mode,
                 show_thinking=self.show_thinking,
-                show_metrics=self.show_metrics,
+                show_metrics=self.show_metrics and not silent_mode,
                 answer_render_mode=self.answer_render_mode,
                 cancellation_check=lambda: self.abort_current_query
             )
@@ -726,7 +758,7 @@ class MCPClient:
 
             enabled_tools = self.tool_manager.get_enabled_tool_objects()
 
-        if not response_text and not self.abort_current_query:
+        if not response_text and not self.abort_current_query and not silent_mode:
             current_model = self.model_manager.get_current_model()
             tool_count = len(self.tool_manager.get_enabled_tool_objects())
             history_count = len(self.chat_history)
@@ -1766,6 +1798,222 @@ async def async_main(mcp_server, mcp_server_url, servers_json, auto_discovery, m
             # Suppress any cleanup errors (BrokenResourceError, etc.)
             # These can occur during stdio server shutdown race conditions
             pass
+
+@app.command()
+def batch(
+    config: str = typer.Option(
+        ...,
+        "--config",
+        "-c",
+        help="Path to batch configuration JSON file",
+        rich_help_panel="Batch Mode Configuration"
+    ),
+    output_file: str = typer.Option(
+        ...,
+        "--output-file",
+        "-o",
+        help="Path to output JSON file for results",
+        rich_help_panel="Batch Mode Configuration"
+    ),
+    input_format: str = typer.Option(
+        "lines",
+        "--input-format",
+        "-f",
+        help="Input format: 'lines' (one query per line) or 'jsonl' (JSON objects per line)",
+        rich_help_panel="Batch Mode Configuration"
+    ),
+    loop_limit: int = typer.Option(
+        3,
+        "--loop-limit",
+        "-l",
+        help="Agent loop limit for tool iterations",
+        rich_help_panel="Batch Mode Configuration"
+    )
+):
+    """Run ollmcp in non-interactive batch mode for automated workflows.
+
+    Reads queries from stdin and processes them sequentially with auto-approved tool execution.
+    Results are written to the specified output file in JSON format.
+
+    Example usage:
+        echo "Summarize these alerts" | ollmcp batch --config config.json --output-file results.json
+        cat queries.jsonl | ollmcp batch --config config.json --output-file results.json --input-format jsonl
+    """
+    # Run the async batch function with proper cleanup
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(async_batch_main(config, output_file, input_format, loop_limit))
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_default_executor())
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
+
+
+async def async_batch_main(config_path: str, output_file: str, input_format: str, loop_limit: int):
+    """Asynchronous main function for batch mode processing"""
+    import sys
+
+    # Load configuration
+    if not os.path.exists(config_path):
+        print(f"Error: Config file not found: {config_path}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        with open(config_path, 'r') as f:
+            config_data = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in config file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Create client with config
+    host = config_data.get("host", DEFAULT_OLLAMA_HOST)
+    model = config_data.get("model", DEFAULT_MODEL)
+    client = MCPClient(model=model, host=host)
+
+    # Check Ollama connection
+    if not await preflight_ollama(client, host):
+        print("Error: Cannot connect to Ollama server", file=sys.stderr)
+        sys.exit(1)
+
+    # Connect to servers from config
+    server_paths = config_data.get("server_paths", None)
+    server_urls = config_data.get("server_urls", None)
+    servers_json = config_data.get("servers_json", None)
+    auto_discovery = config_data.get("auto_discovery", False)
+
+    try:
+        await client.connect_to_servers(server_paths, server_urls, servers_json, auto_discovery)
+    except Exception as e:
+        print(f"Error connecting to servers: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Apply configuration settings
+    if "model" in config_data:
+        client.model_manager.set_model(config_data["model"])
+
+    if "enabledTools" in config_data:
+        available_tool_names = {tool.name for tool in client.tool_manager.get_available_tools()}
+        for tool_name, enabled in config_data["enabledTools"].items():
+            if tool_name in available_tool_names:
+                client.tool_manager.set_tool_status(tool_name, enabled)
+                client.server_connector.set_tool_status(tool_name, enabled)
+
+    if "modelConfig" in config_data:
+        client.model_config_manager.set_config(config_data["modelConfig"])
+
+    if "agentSettings" in config_data and "loopLimit" in config_data["agentSettings"]:
+        try:
+            client.loop_limit = max(1, int(config_data["agentSettings"]["loopLimit"]))
+        except (TypeError, ValueError):
+            pass
+
+    # Override loop limit if specified on command line
+    if loop_limit:
+        client.loop_limit = max(1, loop_limit)
+
+    # Disable HIL for batch mode
+    client.hil_manager.set_enabled(False)
+
+    # Disable context retention for batch mode (each query is independent)
+    client.retain_context = False
+
+    # Read queries from stdin
+    queries = []
+    if input_format == "jsonl":
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, str):
+                        queries.append(data)
+                    elif isinstance(data, dict) and "query" in data:
+                        queries.append(data["query"])
+                    else:
+                        print(f"Warning: Skipping invalid JSONL line: {line}", file=sys.stderr)
+                except json.JSONDecodeError:
+                    print(f"Warning: Skipping invalid JSON line: {line}", file=sys.stderr)
+    else:  # lines format
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                queries.append(line)
+
+    if not queries:
+        print("Error: No queries provided via stdin", file=sys.stderr)
+        sys.exit(1)
+
+    # Process queries
+    results = []
+    total_queries = len(queries)
+    any_errors = False
+
+    print(f"Starting batch processing of {total_queries} queries...", file=sys.stderr)
+    print(f"Model: {client.model_manager.get_current_model()}", file=sys.stderr)
+    print(f"Tools enabled: {len(client.tool_manager.get_enabled_tool_objects())}", file=sys.stderr)
+    print("", file=sys.stderr)
+
+    for i, query in enumerate(queries, 1):
+        print(f"Processing query {i}/{total_queries}...", file=sys.stderr, end="\r")
+        sys.stderr.flush()
+
+        start_time = time.time()
+        result = {
+            "query": query,
+            "success": False,
+            "response": None,
+            "error": None,
+            "tool_calls": 0,
+            "duration_ms": 0
+        }
+
+        try:
+            # Clear context for each query
+            client.chat_history = []
+            client.actual_token_count = 0
+
+            # Process query in silent mode
+            response = await client.process_query(query, silent_mode=True)
+            result["response"] = response
+            result["success"] = True
+            result["tool_calls"] = len(client.tool_manager.get_enabled_tool_objects())
+
+        except Exception as e:
+            result["error"] = str(e)
+            any_errors = True
+            print(f"\nError processing query {i}: {e}", file=sys.stderr)
+
+        finally:
+            result["duration_ms"] = int((time.time() - start_time) * 1000)
+            results.append(result)
+
+    print(f"\n\nCompleted processing {total_queries} queries", file=sys.stderr)
+    print(f"Successful: {sum(1 for r in results if r['success'])}", file=sys.stderr)
+    print(f"Failed: {sum(1 for r in results if not r['success'])}", file=sys.stderr)
+    print(f"Writing results to {output_file}...", file=sys.stderr)
+
+    # Write results to output file
+    try:
+        with open(output_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Results written successfully", file=sys.stderr)
+    except Exception as e:
+        print(f"Error writing output file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # Cleanup
+    try:
+        await client.cleanup()
+    except Exception:
+        pass
+
+    # Exit with error code if any queries failed
+    if any_errors:
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     app()
